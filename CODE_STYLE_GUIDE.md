@@ -837,19 +837,219 @@ AppLogger.instance.error('Что не удалось сделать', error, sta
 
 ---
 
-## 12. Сеть / API (`dio`)
+## 12. Сеть / API: HTTP-запросы (`dio`)
 
-- **Один настроенный `Dio` в DI** (baseUrl, таймауты, интерсепторы) — не создавай `Dio()`
-  на каждый запрос.
-- Слой: **data-provider/Api** (HTTP) → возвращает **DTO** → репозиторий мапит в сущности
-  (§4). Сырые `Map<String,dynamic>` выше data-слоя не поднимаются.
-- Интерсепторы: токен авторизации, логирование (`talker_dio_logger`), refresh токена.
-- Таймауты (`connectTimeout`/`receiveTimeout`) — обязательно. `DioException` лови и
-  переводи в доменную ошибку (§13).
-  ```dart
-  final dio = Dio(BaseOptions(baseUrl: cfg.apiUrl, connectTimeout: const Duration(seconds: 15)))
-    ..interceptors.add(AppLogger.dioLogger);
-  ```
+Когда у приложения появляется бэкенд, весь обмен по HTTP живёт в **data-слое**: тонкий
+api-сервис делает запросы и отдаёт **DTO**, репозиторий мапит DTO в доменные сущности
+(§4). Выше data-слоя сырые `Map`/`Response`/`DioException` **не поднимаются** — UI и
+блок про HTTP ничего не знают (как и про БД).
+
+### 12.1 Один настроенный `Dio` в DI
+
+Создаём **один** `Dio` с baseUrl, таймаутами и интерсепторами и кладём в DI. `Dio()` на
+каждый запрос — запрещено (теряются настройки/интерсепторы, лишние аллокации).
+
+```dart
+Dio buildDio(AppConfig cfg) => Dio(
+  BaseOptions(
+    baseUrl: cfg.apiUrl,                         // из конфига окружения (§16), не хардкод
+    connectTimeout: const Duration(seconds: 15),
+    receiveTimeout: const Duration(seconds: 20),
+    sendTimeout: const Duration(seconds: 20),
+    headers: {'Content-Type': 'application/json'},
+  ),
+)
+  ..interceptors.add(AuthInterceptor(secrets: secrets))   // порядок важен — см. §12.3
+  ..interceptors.add(AppLogger.dioLogger);                // логгер — последним
+```
+
+```dart
+// main.dart — создаём один раз и раздаём через DI:
+Provider<Dio>(create: (_) => buildDio(cfg)),
+```
+
+- **Таймауты обязательны.** Без них зависший сокет держит запрос вечно (а пользователь —
+  бесконечный спиннер). `connectTimeout`/`receiveTimeout`/`sendTimeout` — в `BaseOptions`.
+- baseUrl и общие заголовки — в `BaseOptions`, а не на каждом вызове.
+
+### 12.2 Api-сервис (data-provider) → DTO
+
+HTTP-вызовы оборачиваем в сервис фичи (`data/services/` или `data/providers/`). Он знает
+про эндпоинты и DTO, **не знает** про БД/виджеты. Возвращает **DTO**; в доменную сущность
+мапит репозиторий (§4).
+
+```dart
+class NoteApi {
+  final Dio _dio;
+  NoteApi({required Dio dio}) : _dio = dio;
+
+  Future<List<NoteDto>> fetchNotes() async {
+    final resp = await _dio.get<dynamic>('/v1/notes');
+    final list = _unwrap(resp.data) as List;                  // §12.4
+    return list.cast<Map<String, dynamic>>().map(NoteDto.fromJson).toList();
+  }
+
+  Future<NoteDto> createNote(NoteRequestDto body) async {
+    final resp = await _dio.post<dynamic>('/v1/notes', data: body.toJson());
+    return NoteDto.fromJson(_unwrap(resp.data) as Map<String, dynamic>);
+  }
+}
+```
+
+- Путь, query (`queryParameters:`), тело (`data:`) — здесь. Тело — `toJson()` из DTO, а
+  не россыпь строковых ключей по коду.
+- Один метод = один эндпоинт; парсинг ответа в DTO — тут же. Сборка URL — через
+  `queryParameters`, не конкатенацией строк (dio сам экранирует).
+
+### 12.3 Интерсепторы: токен, refresh, логирование
+
+Сквозные заботы (одно и то же на каждом запросе) — в интерсепторы, а не копипастой по
+методам.
+
+- **Авторизация** — в `onRequest` дописать `Authorization: Bearer <token>` из secure storage.
+- **Refresh на 401** — в `onError` при `401` обновить access по refresh-токену и **повторить**
+  исходный запрос; параллельные 401 синхронизировать (один refresh, остальные ждут его),
+  чтобы не рефрешить N раз. Refresh не удался → разлогинить (почистить токены) и отдать
+  понятную ошибку «сессия истекла».
+- **Логирование** — `talker_dio_logger` (`AppLogger.dioLogger`), добавлять **последним**.
+
+```dart
+class AuthInterceptor extends Interceptor {
+  final SecureStorageService _secrets;
+  AuthInterceptor({required SecureStorageService secrets}) : _secrets = secrets;
+
+  @override
+  Future<void> onRequest(options, handler) async {
+    final token = await _secrets.getToken();
+    if (token != null) options.headers['Authorization'] = 'Bearer $token';
+    handler.next(options);
+  }
+
+  @override
+  Future<void> onError(err, handler) async {
+    if (err.response?.statusCode == 401 && await _refreshOnce()) {
+      return handler.resolve(await _retry(err.requestOptions));   // повтор с новым токеном
+    }
+    handler.next(err);
+  }
+}
+```
+
+> Эквивалент — refresh внутри обёртки `_send()` api-сервиса (см. реальный `CloudApiService`
+> в beacon). Главное: **refresh в одном месте**, а не на каждом вызове. При **ротации**
+> refresh-токена (старый инвалидируется при обновлении) сохраняй новую пару целиком.
+
+### 12.4 Распаковка ответа: envelope `{success, data}`
+
+Многие API заворачивают полезную нагрузку: `{"success": true, "data": {...}}` или
+`{"data": [...], "meta": {...}}`. Держи распаковку в **одном хелпере**, а не повторяй
+`resp.data['data']` в каждом методе.
+
+```dart
+/// Достаёт нагрузку из конверта `{success, data}` (или отдаёт объект как есть).
+static Object? _unwrap(dynamic raw) {
+  if (raw is Map && raw['data'] != null) return raw['data'];
+  return raw;
+}
+```
+
+Сменился формат — правишь одно место. (Из жизни: BFF-шлюз отдаёт `{success, data}`, а
+часть «родных» ручек — голый объект; один `_unwrap` покрывает оба случая.)
+
+### 12.5 Ошибки сети: `DioException` → доменная ошибка
+
+`DioException` ловим в data-слое и переводим в доменную ошибку (§13) — наружу не
+выпускаем. Тип сбоя — в `DioExceptionType`:
+
+```dart
+Never _mapError(DioException e) {
+  final message = switch (e.type) {
+    DioExceptionType.connectionTimeout ||
+    DioExceptionType.sendTimeout ||
+    DioExceptionType.receiveTimeout => 'Тайм-аут соединения',
+    DioExceptionType.connectionError => 'Нет связи. Проверьте интернет.',
+    DioExceptionType.badResponse => _describeStatus(e.response?.statusCode, e.response?.data),
+    _ => 'Ошибка сети',
+  };
+  AppLogger.instance.error('Сбой запроса ${e.requestOptions.uri}', e, e.stackTrace);
+  throw NetworkFailure(message);     // доменная ошибка, НЕ e.toString() пользователю
+}
+```
+
+- Текст из тела ошибки (`{"error": {"message": ...}}` или `{"error": "..."}`) парсим в
+  одном месте; пользователю — человеческое сообщение, в лог — стек (§13).
+- `4xx` (валидация/права — обычно не повторяемые) и `5xx`/таймаут (повторяемые) — разные
+  ветки: первые показываем как есть, вторые можно ретраить (§12.7).
+
+### 12.6 Отмена запроса (`CancelToken`)
+
+Запрос, чей результат больше не нужен (ушли с экрана, начался новый поиск), — отменяй:
+экономит трафик и спасает от «emit после close».
+
+```dart
+final _cancel = CancelToken();
+_dio.get('/v1/search', queryParameters: {'q': q}, cancelToken: _cancel);
+// при отмене/закрытии блока:
+_cancel.cancel('экран закрыт');
+```
+
+`DioExceptionType.cancel` — это **не** ошибка для пользователя: проглатываем молча (можно
+залогировать debug). Для живого поиска удобнее `restartable()` transformer (§15) + новый
+`CancelToken` на каждый ввод.
+
+### 12.7 Повторы, идемпотентность, файлы
+
+- **Ретрай** — только для **идемпотентных** запросов (GET) и сетевых сбоев/5xx, с
+  экспоненциальным бэкоффом и лимитом попыток. POST/платёж без ключа идемпотентности
+  вслепую не повторяем (риск дубля).
+- **Загрузка/выгрузка файлов** — `FormData`/`MultipartFile`; прогресс — `onSendProgress`/
+  `onReceiveProgress`. Большие файлы — стримом, не целиком в память.
+- **Заголовки/таймаут на конкретный вызов** — `Options(headers: ..., receiveTimeout: ...)`.
+
+### 12.8 Типизированный клиент (`retrofit`) — опционально
+
+Когда эндпоинтов много, ручные методы заменяет `retrofit` (кодоген поверх dio):
+аннотируешь интерфейс — генерится реализация, возвращающая DTO.
+
+```dart
+@RestApi()
+abstract class NoteClient {
+  factory NoteClient(Dio dio) = _NoteClient;
+  @GET('/v1/notes') Future<List<NoteDto>> fetchNotes();
+  @POST('/v1/notes') Future<NoteDto> create(@Body() NoteRequestDto body);
+}
+```
+
+Слой тот же (api → DTO → маппер), просто меньше ручного парсинга. Для пары запросов
+проще ручной сервис; для большого API — `retrofit`.
+
+### 12.9 Живые данные: WebSocket / SSE / polling
+
+REST-эндпоинт «подписать» нельзя (§4): для данных, которые приходят **сами** (метрики,
+статусы, чат, уведомления), нужен отдельный канал. Главная идея — **обернуть его в сервис,
+который отдаёт `Stream<T>` доменных сущностей**, и тогда блок подписывается на него точно
+так же, как на реактивный `watchAll()` из БД.
+
+- **WebSocket** (`web_socket_channel`) — двунаправленный поток. Сервис парсит кадр
+  (JSON → DTO → entity) и публикует в `Stream<T>`; исходящие сообщения — методом `send`.
+- **SSE / long-polling** — односторонний поток событий; та же обёртка `Stream<T>`.
+- **Periodic polling** — если живого канала нет: `Timer.periodic` дёргает `Future`-метод
+  api-сервиса; интервал — настройка, тикер **прерываемый** и закрывается в `close()`.
+
+Правила живого канала:
+- **Один канал на ресурс** через app-level сервис (как единый `Dio`), с подсчётом
+  подписчиков: открываем на первого, закрываем на последнего. Не плоди по сокету на экран.
+- **Авто-reconnect с бэкоффом** при обрыве; **не спамь лог** на каждой попытке (одна
+  строка на обрыв). Реагируй на жизненный цикл приложения (ушли в фон → приостанови/закрой,
+  вернулись → подними).
+- **broadcast**-поток, если слушателей несколько; всегда отписывайся
+  (`StreamSubscription.cancel()`) в `close()`/`dispose()` (§24).
+- Токен для WS передавай в query или первом сообщении (произвольные заголовки в вебсокете
+  ограничены).
+
+Блок остаётся **тонким подписчиком** — `emit.forEach(service.watch(id), onData: ...)`,
+ровно как с реактивной БД; меняется только источник потока. (Пример из жизни: beacon
+держит один аккаунт-WS на все машины и раздаёт метрики/статусы по `server_id` через хаб.)
 
 ---
 
@@ -1064,5 +1264,8 @@ on<SearchChanged>(_onSearch, transformer: restartable());
 - ❌ Запихивать две независимые заботы в один блок. ✅ Дробить на фичи (§3.1).
 - ❌ Дёргать `SharedPreferences.getInstance()`/сырой клиент при каждом обращении, вне DI.
   ✅ Сервис-обёртка + DI, подключение один раз (§6.1).
+- ❌ `Dio()` на каждый запрос / без таймаутов / `e.toString()` пользователю / парсинг
+  `resp.data` прямо в виджете. ✅ Один `Dio` в DI с таймаутами и интерсепторами, api-сервис
+  → DTO, `DioException` → доменная ошибка (§12).
 - ❌ Мутировать список/мапу в состоянии (`list.add`). ✅ Новый объект (`[...list, x]`) (§24).
 - ❌ Редактировать `*.freezed.dart`/`*.g.dart`. ✅ Менять исходник и гнать `build_runner`.
