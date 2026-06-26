@@ -34,6 +34,7 @@
 | Неизменяемые модели | `freezed` (+ `freezed_annotation`) | `copyWith`, `==`, union-типы «из коробки» |
 | Локальная БД | `drift` (+ `drift_dev`) | типобезопасный SQLite с реактивными запросами |
 | Секреты | `flutter_secure_storage` | пароли/токены в Keychain/Keystore, не в БД |
+| Сеть / API (когда есть бэкенд) | `dio` + `retrofit` | один HTTP-клиент + типизированный `@RestApi`-сервис, отдающий DTO |
 | DI (внедрение зависимостей) | `provider` (только для DI!) | прокинуть репозитории/блоки вниз по дереву |
 | Логирование | `talker` / `talker_flutter` | единый логгер вместо `print` |
 | Уникальные id | `uuid` | генерация id сущностей |
@@ -872,34 +873,76 @@ Provider<Dio>(create: (_) => buildDio(cfg)),
   бесконечный спиннер). `connectTimeout`/`receiveTimeout`/`sendTimeout` — в `BaseOptions`.
 - baseUrl и общие заголовки — в `BaseOptions`, а не на каждом вызове.
 
-### 12.2 Api-сервис (data-provider) → DTO
+### 12.2 Api-сервис на `retrofit` (`@RestApi`) → DTO
 
-HTTP-вызовы оборачиваем в сервис фичи (`data/services/` или `data/providers/`). Он знает
-про эндпоинты и DTO, **не знает** про БД/виджеты. Возвращает **DTO**; в доменную сущность
-мапит репозиторий (§4).
+Канонический способ описать HTTP-слой — **типизированный клиент `retrofit`** (кодоген
+поверх `dio`): объявляешь `abstract`-интерфейс с аннотациями маршрутов, а реализацию
+(`_*.g.dart`) генерит `build_runner`. Методы **возвращают DTO напрямую** — ручного
+`resp.data`/парсинга нет. Api-сервис знает про эндпоинты и DTO, **не знает** про БД/виджеты.
 
 ```dart
-class NoteApi {
-  final Dio _dio;
-  NoteApi({required Dio dio}) : _dio = dio;
+import 'package:dio/dio.dart';
+import 'package:retrofit/retrofit.dart';
 
-  Future<List<NoteDto>> fetchNotes() async {
-    final resp = await _dio.get<dynamic>('/v1/notes');
-    final list = _unwrap(resp.data) as List;                  // §12.4
-    return list.cast<Map<String, dynamic>>().map(NoteDto.fromJson).toList();
-  }
+part 'mission_http_api_service.g.dart';
 
-  Future<NoteDto> createNote(NoteRequestDto body) async {
-    final resp = await _dio.post<dynamic>('/v1/notes', data: body.toJson());
-    return NoteDto.fromJson(_unwrap(resp.data) as Map<String, dynamic>);
-  }
+@RestApi()
+abstract class MissionHttpApiService {
+  factory MissionHttpApiService(Dio dio, {String? baseUrl}) = _MissionHttpApiService;
+
+  /// Текущие миссии техника. [areaIds] — повторяемый `area_id` (OR-фильтр по территориям).
+  @GET('/missions/current')
+  Future<MissionsResponseDto> getCurrentMissions({
+    @Query('show_closed') bool? showClosed,
+    @Query('area_id') List<String>? areaIds,
+  });
+
+  /// Справочник территорий (дерево городов и районов).
+  @GET('/missions/areas')
+  Future<List<AreaDto>> getAreas();
+
+  /// Начать миссию.
+  @POST('/missions/{mission_id}/start')
+  Future<void> startMission({@Path('mission_id') required String missionId});
+
+  /// Подтвердить прибытие на точку.
+  @PATCH('/missions/{mission_id}/checkpoints/{checkpoint_id}/arrive')
+  Future<void> arriveAtCheckpoint({
+    @Path('mission_id') required String missionId,
+    @Path('checkpoint_id') required String checkpointId,
+  });
+
+  /// Отправить отчёт по миссии.
+  @POST('/missions/{mission_id}/report/executor')
+  Future<void> submitMissionReport({
+    @Path('mission_id') required String missionId,
+    @Body() required MissionReportSubmitDto body,
+  });
 }
 ```
 
-- Путь, query (`queryParameters:`), тело (`data:`) — здесь. Тело — `toJson()` из DTO, а
-  не россыпь строковых ключей по коду.
-- Один метод = один эндпоинт; парсинг ответа в DTO — тут же. Сборка URL — через
-  `queryParameters`, не конкатенацией строк (dio сам экранирует).
+Правила:
+- **Один api-сервис на ресурс/группу эндпоинтов** (`<Имя>HttpApiService`): `abstract` +
+  `factory ... = _Impl;` + `part '<файл>.g.dart'`. Реализацию пишет кодоген
+  (`dart run build_runner build`), руками `_*.g.dart` не трогаем.
+- Метод = один эндпоинт; глагол — `@GET/@POST/@PATCH/@PUT/@DELETE`. Параметры аннотируем:
+  `@Path('id')` — часть пути, `@Query('key')` — query (в т.ч. `List<T>` — повторяемый
+  параметр), `@Body()` — тело (DTO с `toJson`). Параметры — именованные `required`/опциональные.
+- **Возвращаем DTO или `void`:** `Future<XDto>` / `Future<List<XDto>>`. В доменную
+  сущность мапит **репозиторий** (§4), не api-сервис. Сырые `Map`/`Response` наружу не уходят.
+- `Dio` — тот же из DI (§12.1, с таймаутами/интерсепторами); `baseUrl` берётся из него,
+  параметр `baseUrl` фабрики — для редкого переопределения.
+- Док-комментарий `///` на каждый метод: что делает + нюансы (права, особые коды ответа,
+  смысл параметров).
+
+Сервис кладём в DI как репозиторий (фабрику зовём в провайдере фичи или в `main`):
+
+```dart
+RepositoryProvider<MissionHttpApiService>(
+  create: (ctx) => MissionHttpApiService(ctx.read<Dio>()),
+  child: /* RepositoryProvider репозитория, который его использует */,
+)
+```
 
 ### 12.3 Интерсепторы: токен, refresh, логирование
 
@@ -942,19 +985,26 @@ class AuthInterceptor extends Interceptor {
 ### 12.4 Распаковка ответа: envelope `{success, data}`
 
 Многие API заворачивают полезную нагрузку: `{"success": true, "data": {...}}` или
-`{"data": [...], "meta": {...}}`. Держи распаковку в **одном хелпере**, а не повторяй
-`resp.data['data']` в каждом методе.
+`{"data": [...], "meta": {...}}`. Распаковку держи в **одном месте**.
 
-```dart
-/// Достаёт нагрузку из конверта `{success, data}` (или отдаёт объект как есть).
-static Object? _unwrap(dynamic raw) {
-  if (raw is Map && raw['data'] != null) return raw['data'];
-  return raw;
-}
-```
+- **С `retrofit`** (метод сразу десериализует тело в DTO) снимай конверт **в интерсепторе**
+  `onResponse` — до того, как retrofit увидит тело, чтобы методы возвращали чистые DTO:
+  ```dart
+  @override
+  void onResponse(response, handler) {
+    final d = response.data;
+    if (d is Map && d.containsKey('data')) response.data = d['data'];
+    handler.next(response);
+  }
+  ```
+- **При ручном вызове** (§12.8) — один хелпер, а не `resp.data['data']` в каждом методе:
+  ```dart
+  static Object? _unwrap(dynamic raw) =>
+      (raw is Map && raw['data'] != null) ? raw['data'] : raw;
+  ```
 
-Сменился формат — правишь одно место. (Из жизни: BFF-шлюз отдаёт `{success, data}`, а
-часть «родных» ручек — голый объект; один `_unwrap` покрывает оба случая.)
+Сменился формат — правишь одну точку. (Из жизни: BFF-шлюз отдаёт `{success, data}`, а
+часть «родных» ручек — голый объект; единая распаковка покрывает оба случая.)
 
 ### 12.5 Ошибки сети: `DioException` → доменная ошибка
 
@@ -1006,22 +1056,28 @@ _cancel.cancel('экран закрыт');
   `onReceiveProgress`. Большие файлы — стримом, не целиком в память.
 - **Заголовки/таймаут на конкретный вызов** — `Options(headers: ..., receiveTimeout: ...)`.
 
-### 12.8 Типизированный клиент (`retrofit`) — опционально
+### 12.8 Ручной вызов `dio` — только для единичных случаев
 
-Когда эндпоинтов много, ручные методы заменяет `retrofit` (кодоген поверх dio):
-аннотируешь интерфейс — генерится реализация, возвращающая DTO.
+Основной способ — `retrofit` (§12.2). Прямой вызов `dio` допустим, лишь когда retrofit
+не подходит: нестандартный ответ, ручная сборка запроса, стриминг тела. Контракт тот же —
+сервис возвращает **DTO**:
 
 ```dart
-@RestApi()
-abstract class NoteClient {
-  factory NoteClient(Dio dio) = _NoteClient;
-  @GET('/v1/notes') Future<List<NoteDto>> fetchNotes();
-  @POST('/v1/notes') Future<NoteDto> create(@Body() NoteRequestDto body);
+class NoteApi {
+  final Dio _dio;
+  NoteApi({required Dio dio}) : _dio = dio;
+
+  Future<List<NoteDto>> fetchNotes() async {
+    final resp = await _dio.get<dynamic>('/v1/notes');
+    final list = _unwrap(resp.data) as List;                  // §12.4
+    return list.cast<Map<String, dynamic>>().map(NoteDto.fromJson).toList();
+  }
 }
 ```
 
-Слой тот же (api → DTO → маппер), просто меньше ручного парсинга. Для пары запросов
-проще ручной сервис; для большого API — `retrofit`.
+- Query — через `queryParameters:`, тело — `data: body.toJson()`; URL не клеим строками
+  (dio экранирует сам).
+- Для полноценного API всё равно предпочитай `retrofit` — меньше ручного парсинга и ошибок.
 
 ### 12.9 Живые данные: WebSocket / SSE / polling
 
